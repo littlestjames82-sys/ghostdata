@@ -9,11 +9,52 @@ redacted.
 GhostSlice governs what an agent reads from code, GhostDocs what it
 reads from documents, GhostData what it reads from datasets.
 
+## Install and run
+
+Requires Python 3.11 or newer. There are no third-party dependencies:
+everything runs on the Python standard library.
+
+Install from a checkout:
+
+    pip install .
+    ghostdata --help
+
+Or run it straight from the checkout without installing:
+
+    PYTHONPATH=src python3 -m ghostdata --help
+
+Every command also answers to `--help`, for example
+`ghostdata pack --help`, with its arguments, defaults, and exit
+codes spelled out.
+
+## Quick start
+
+Using the small example file shipped in `examples/`:
+
+    ghostdata schema examples/customers.csv
+    ghostdata pack examples/customers.csv -o customers-pack
+    ghostdata check customers-pack
+
+The `schema` command prints one JSON object to stdout: the detected
+`format`, the true `counts` (rows parsed, malformed, and total), and
+one entry per column under `columns` (inferred type, null count and
+rate, distinct count, ranges, and whether the column is redacted).
+
+The `pack` command prints a short summary, including any columns it
+redacted and why, and writes the pack directory described under
+"The pack" below. The `check` command re-verifies that pack against
+its manifest and prints `{"ok": true, "errors": [], ...}` when the
+sample still matches.
+
+Two worked example packs are checked in under `examples/`; see
+`examples/README.md` for a walk-through of both.
+
 ## What it does
 
 - Infers the schema by streaming the file: field names, inferred
-  types, null counts and rates, distinct counts, numeric ranges, and
-  string length ranges.
+  types, null counts and rates, distinct counts, numeric ranges,
+  string length ranges, and, for columns that infer as dates, the
+  earliest and latest values seen.
 - Builds a sample pack: head rows, tail rows, and evenly spaced rows
   from the middle, so the sample is not just the first screen of a
   sorted file. The sample size and strategy are stated in the pack.
@@ -56,12 +97,28 @@ payloads, sample rows not returned by default):
 
 Options that matter:
 
-- `--sample N` sets the total sample size. Default is 60.
-- `--no-redact` turns redaction off. Use it only on files you own and
-  trust. The manifest records that redaction was disabled.
+- `--sample N` sets the total sample size for `pack`. Default is
+  60. The bound is exact: a pack never contains more than N sample
+  rows, even for small values such as `--sample 1`.
+- `--no-redact` turns redaction off (on `pack` and `schema`). Use it
+  only on files you own and trust. The manifest records that
+  redaction was disabled.
 - `--format csv|tsv|json|jsonl|json-object` overrides format
-  detection. Plain `json` dispatches on the file's top-level shape:
-  an array streams, an object is read as one record.
+  detection (on `pack` and `schema`). Plain `json` dispatches on the
+  file's top-level shape: an array streams, an object is read as one
+  record. Detection otherwise comes from the file extension, or,
+  for files with no recognised extension, from sniffing the first
+  bytes.
+
+Exit codes:
+
+- `0`: the command succeeded. For `check`, the pack verified.
+- `1`: `check` only: the pack did not verify. The JSON result names
+  each problem under `errors`.
+- `2`: the command could not run at all, for example a missing or
+  unsupported input file, a top-level JSON scalar, or bad command
+  line arguments. The reason is printed to stderr, prefixed with
+  `ghostdata:`.
 
 ## Redaction rules
 
@@ -97,6 +154,15 @@ recorded in the manifest by its path (for example
   table plus the sample in its native format.
 - `files/<name>.sample.<ext>`: the sample itself.
 
+When reading a pack someone else built, start with three questions,
+all answered in `manifest.json`: do `counts.rows_total`,
+`counts.rows_parsed`, and `counts.rows_malformed` add up (total is
+parsed plus malformed); which columns does `redaction.columns` list,
+and was `redaction.enabled` left on; and how big is the sample
+(`sample.rows`, `sample.strategy`, `sample.row_indices`) compared
+with the file it came from. Run `ghostdata check <pack-dir>` before
+trusting any of it.
+
 Token figures are estimates from the GhostSlice estimator when it is
 available, or from a documented local fallback with its own method
 string. The method is always stamped, so the two are never confused.
@@ -110,6 +176,15 @@ string. The method is always stamped, so the two are never confused.
   code, not a quantity.
 - Distinct counts are capped at 10,000 values per column. Past the
   cap the count is reported as capped, a lower bound, never as exact.
+- Date ranges compare parsed calendar values, not text: timezone
+  offsets are normalised to UTC before comparing, date-only values
+  sort at the start of their day, and the reported earliest and
+  latest keep the spelling used in the source. Only a column that
+  infers purely as a date reports a range. A column that mixes dates
+  with other values, or holds a date-shaped value that is not a real
+  calendar date (for example 2024-13-45), reports no date range
+  rather than a partial or misleading one. Like numeric ranges, a
+  date range is suppressed for redacted columns.
 - Shape detection can miss obfuscated sensitive values and can
   over-redact a look-alike column. The manifest shows the reason so a
   human can judge. Shape checks run on string values, and on native

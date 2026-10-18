@@ -91,6 +91,8 @@ def bound_object(obj: dict):
 
 
 def file_sha256(path: str) -> str:
+    """Return the sha256 hex digest of a file, read in chunks so the
+    file is never held whole in memory."""
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 16), b""):
@@ -99,8 +101,13 @@ def file_sha256(path: str) -> str:
 
 
 def full_token_estimate(path: str) -> int:
+    """Estimate the token count of the whole file, streamed in chunks.
+
+    The result is an estimate (see tokens.method() for the estimator
+    that produced it), not an exact tokenizer count.
+    """
     est = ChunkedEstimator()
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         for chunk in iter(lambda: fh.read(65536), ""):
             est.feed(chunk)
     est.flush()
@@ -108,8 +115,15 @@ def full_token_estimate(path: str) -> int:
 
 
 def sample_indices(total: int, sample_size: int):
-    """Head + tail + evenly spaced middle indices into [0, total)."""
-    if total <= 0:
+    """Head + tail + evenly spaced middle indices into [0, total).
+
+    ``sample_size`` is a hard bound: the result never holds more
+    indices than requested, including a request for 1. Returns
+    (indices, strategy) where strategy counts how the indices split
+    across head, tail, and spaced middle rows, and flags
+    ``all_rows`` when the file is smaller than the sample size.
+    """
+    if total <= 0 or sample_size <= 0:
         return [], {"head": 0, "tail": 0, "spaced": 0}
     if sample_size >= total:
         return list(range(total)), {
@@ -137,8 +151,38 @@ def sample_indices(total: int, sample_size: int):
 
 def analyze(path: str, sample_size: int = DEFAULT_SAMPLE,
             redact: bool = True, fmt: str = None) -> dict:
+    """Analyze one data file in two streaming passes.
+
+    The first pass infers the schema and counts every row: parsed,
+    malformed (with example line numbers), and blank. Counts are true
+    counts, never estimates. The second pass collects the bounded
+    sample (head, tail, and evenly spaced rows; a top-level JSON
+    object is its own single-record sample, structurally bounded by
+    bound_object). When ``redact`` is true, sensitive columns and
+    nested values are replaced with [REDACTED] in the sample and the
+    schema suppresses their ranges.
+
+    Returns a dict with the detected format, column names, per-column
+    schema, counts, the redaction record, and the sample. The sample
+    rows ride under the private ``_rows`` key for pack.render_sample
+    and are not part of the manifest. Raises DataError for a missing
+    file or an unreadable or unsupported format. The source file is
+    only read, never modified.
+    """
     if not os.path.isfile(path):
         raise DataError("no such file: %s" % path)
+    try:
+        sample_size = int(sample_size)
+    except (TypeError, ValueError):
+        raise DataError(
+            "sample size must be a positive integer, got %r"
+            % (sample_size,))
+    if sample_size < 1:
+        # Zero or negative sizes used to flow into sample_indices and
+        # produce a pack whose manifest carried negative strategy
+        # counts (head -1, tail -2) instead of an error.
+        raise DataError(
+            "sample size must be at least 1, got %d" % sample_size)
     reader = readers.open_reader(path, fmt=fmt)
     columns = reader.columns()
     stats = [ColumnStats(name) for name in columns]
@@ -182,6 +226,33 @@ def analyze(path: str, sample_size: int = DEFAULT_SAMPLE,
         if entry not in nested_records:
             nested_records.append(entry)
 
+    def redact_cell(value, name):
+        """Redact one sampled cell that is not in a redacted column.
+
+        Containers get the nested name/shape rules. A scalar cell is
+        also checked on its own shape: column-level redaction needs a
+        stated share of matching values, so a lone email address or
+        card number sitting in a mostly innocuous column (one email
+        in a hundred free-text notes) used to be written into the
+        sample verbatim. A value that matches a sensitive shape is
+        never sampled, whatever its column's overall share is. Hits
+        are recorded by column name in the pack's redaction record.
+        """
+        if isinstance(value, (dict, list)):
+            new_value, hits = sensitive.redact_nested(value, path=name)
+            for hit_path, reason in hits:
+                note_nested(hit_path, reason)
+            return new_value
+        shape = None
+        if isinstance(value, str):
+            shape = sensitive.shape_of(value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            shape = sensitive.shape_of_int(value)
+        if shape:
+            note_nested(name, "value matches %s shape" % shape)
+            return "[REDACTED]"
+        return value
+
     if getattr(reader, "object_mode", False):
         # A top-level object is one record. The sample is the object
         # itself: redacted (whole-key redactions from the stats pass,
@@ -193,11 +264,8 @@ def analyze(path: str, sample_size: int = DEFAULT_SAMPLE,
             value = row[i]
             if redact and name in redactions:
                 obj[name] = "[REDACTED]"
-            elif redact and isinstance(value, (dict, list)):
-                value, hits = sensitive.redact_nested(value, path=name)
-                for hit_path, reason in hits:
-                    note_nested(hit_path, reason)
-                obj[name] = value
+            elif redact:
+                obj[name] = redact_cell(value, name)
             else:
                 obj[name] = value
         obj, sample_truncation = bound_object(obj)
@@ -214,12 +282,8 @@ def analyze(path: str, sample_size: int = DEFAULT_SAMPLE,
                     value = row[i]
                     if stats[i].name in redactions:
                         cells.append("[REDACTED]")
-                    elif redact and isinstance(value, (dict, list)):
-                        value, hits = sensitive.redact_nested(
-                            value, path=stats[i].name)
-                        for hit_path, reason in hits:
-                            note_nested(hit_path, reason)
-                        cells.append(value)
+                    elif redact:
+                        cells.append(redact_cell(value, stats[i].name))
                     else:
                         cells.append(value)
                 sample_rows.append(cells)

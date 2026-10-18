@@ -48,6 +48,11 @@ def _load():
 
 
 def estimate_tokens(text: str) -> int:
+    """Estimate the token count of a text with the loaded estimator.
+
+    Which estimator that is, GhostSlice's or the local fallback, is
+    reported by method() and stamped wherever an estimate is used.
+    """
     _load()
     try:
         return int(_ESTIMATE(text))
@@ -56,6 +61,9 @@ def estimate_tokens(text: str) -> int:
 
 
 def method() -> str:
+    """Return the method string of the active estimator, so every
+    reported estimate can be attributed to the estimator that made
+    it."""
     _load()
     return str(_METHOD)
 

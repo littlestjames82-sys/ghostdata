@@ -28,10 +28,20 @@ MAX_OBJECT_BYTES = 16 * 1024 * 1024
 
 
 class DataError(Exception):
-    pass
+    """A data file cannot be read as a dataset: missing, empty,
+    in an unsupported format, a top-level JSON scalar, or a JSON
+    object over the MAX_OBJECT_BYTES guard. The CLI reports the
+    message on stderr and exits 2."""
 
 
 class Malformed:
+    """One row that could not be parsed, yielded in place of a row.
+
+    Carries the 1-based ``line`` number and a plain-language
+    ``reason`` ("blank" for blank lines). Malformed rows are counted
+    and reported by the caller, never silently skipped.
+    """
+
     def __init__(self, line, reason):
         self.line = line
         self.reason = reason
@@ -41,6 +51,13 @@ class Malformed:
 
 
 def detect_format(path: str) -> str:
+    """Detect a file's format name: csv, tsv, json, or jsonl.
+
+    The extension decides when it is recognised (.csv, .tsv/.tab,
+    .json, .jsonl/.ndjson). Otherwise the first bytes are sniffed: a
+    leading [ or { means JSON, and anything else is delimited text
+    whose delimiter is guessed from the first line.
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         return "csv"
@@ -52,7 +69,7 @@ def detect_format(path: str) -> str:
         return "json"
     # Sniff: first non-whitespace character decides JSON shape,
     # otherwise guess the delimiter from the first line.
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         head = fh.read(4096)
     stripped = head.lstrip()
     if stripped.startswith("["):
@@ -64,6 +81,13 @@ def detect_format(path: str) -> str:
 
 
 class DelimitedReader:
+    """Streaming reader for CSV and TSV files.
+
+    The first row is the header; duplicate or empty header names are
+    made unique by columns(). Rows with the wrong field count are
+    yielded as Malformed with their line number.
+    """
+
     def __init__(self, path, fmt, token_sink=None):
         self.path = path
         self.format = fmt
@@ -81,40 +105,67 @@ class DelimitedReader:
     def columns(self):
         if self._columns is not None:
             return self._columns
-        with open(self.path, "r", encoding="utf-8", errors="replace",
+        with open(self.path, "r", encoding="utf-8-sig", errors="replace",
                   newline="") as fh:
             reader = csv.reader(fh, delimiter=self.delimiter)
-            for row in reader:
-                if row:
-                    self._columns = _dedupe_names(
-                        [c.strip() or "col_%d" % (i + 1)
-                         for i, c in enumerate(row)])
-                    return self._columns
+            try:
+                for row in reader:
+                    if row:
+                        self._columns = _dedupe_names(
+                            [c.strip() or "col_%d" % (i + 1)
+                             for i, c in enumerate(row)])
+                        return self._columns
+            except csv.Error as exc:
+                raise DataError(
+                    "could not parse delimited file: %s" % exc) from exc
         raise DataError("empty file: no header row")
 
     def rows(self):
         """Yield (values list) or Malformed, one per data row."""
         cols = self.columns()
-        with open(self.path, "r", encoding="utf-8", errors="replace",
+        with open(self.path, "r", encoding="utf-8-sig", errors="replace",
                   newline="") as fh:
             reader = csv.reader(self._tap(fh), delimiter=self.delimiter)
             header_seen = False
-            for row in reader:
-                if not header_seen:
-                    header_seen = True
-                    continue
-                if not row:
-                    yield Malformed(reader.line_num, "blank")
-                    continue
-                if len(row) != len(cols):
-                    yield Malformed(
-                        reader.line_num,
-                        "expected %d fields, found %d" % (len(cols), len(row)))
-                    continue
-                yield row
+            try:
+                for row in reader:
+                    if not header_seen:
+                        # The header is the first NON-EMPTY row,
+                        # exactly as columns() finds it. Skipping
+                        # the first physical row unconditionally
+                        # used to consume a leading blank line as the
+                        # header and then count the real header as a
+                        # data row, corrupting the true row counts.
+                        if not row:
+                            continue
+                        header_seen = True
+                        continue
+                    if not row:
+                        yield Malformed(reader.line_num, "blank")
+                        continue
+                    if len(row) != len(cols):
+                        yield Malformed(
+                            reader.line_num,
+                            "expected %d fields, found %d"
+                            % (len(cols), len(row)))
+                        continue
+                    yield row
+            except csv.Error as exc:
+                # e.g. a field over the csv module's size limit:
+                # a clean, stated error, not a traceback crash.
+                raise DataError(
+                    "could not parse delimited file: %s" % exc) from exc
 
 
 class JsonlReader:
+    """Streaming reader for JSONL: one JSON value per line.
+
+    Object lines contribute their keys to the column list, in first
+    seen order. A file whose lines are all bare values instead gets
+    a single "value" column; mixing the two makes the non-object
+    lines Malformed.
+    """
+
     format = "jsonl"
 
     def __init__(self, path, token_sink=None):
@@ -126,7 +177,7 @@ class JsonlReader:
     def _scan(self, collect_columns):
         fields = []
         seen = set()
-        with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(self.path, "r", encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
                 if self.token_sink is not None:
                     self.token_sink.feed(line)
@@ -160,7 +211,7 @@ class JsonlReader:
 
     def rows(self):
         cols = self.columns()
-        with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(self.path, "r", encoding="utf-8-sig", errors="replace") as fh:
             for line_no, line in enumerate(fh, 1):
                 if self.token_sink is not None:
                     self.token_sink.feed(line)
@@ -181,6 +232,15 @@ class JsonlReader:
 
 
 class JsonArrayReader:
+    """Incremental reader for a JSON file whose top level is an array.
+
+    Elements are decoded one at a time from a chunked buffer, so the
+    file is never held whole. An element that cannot be parsed ends
+    the parse: the reader flags itself truncated with a note, and
+    rows() yields one final Malformed rather than guessing at the
+    rest of the file.
+    """
+
     format = "json"
 
     def __init__(self, path, token_sink=None):
@@ -192,11 +252,19 @@ class JsonArrayReader:
         self.truncation_note = None
 
     def _items(self):
-        """Yield parsed array elements; set self.truncated on a bad one."""
+        """Yield parsed array elements; set self.truncated on a bad one.
+
+        The separator structure is enforced: elements must be divided
+        by single commas and the array must close. An earlier version
+        skipped commas and whitespace indiscriminately, so files such
+        as [1 2], [1,,2], and [1,2,] parsed as clean two-row datasets
+        with zero malformed rows, and anything after the closing
+        bracket was ignored without a word.
+        """
         self.truncated = False
         self.truncation_note = None
         decoder = json.JSONDecoder()
-        with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(self.path, "r", encoding="utf-8-sig", errors="replace") as fh:
             buf = ""
             pos = 0
             eof = False
@@ -217,6 +285,10 @@ class JsonArrayReader:
                 buf += chunk
                 return True
 
+            def fail(note):
+                self.truncated = True
+                self.truncation_note = note
+
             fill()
             while pos < len(buf) and buf[pos] in " \t\r\n":
                 pos += 1
@@ -224,41 +296,85 @@ class JsonArrayReader:
                 raise DataError("top level is not a json array")
             pos += 1
             index = 0
-            expect_value = True
+            # state "value": an element (or the closing bracket) is
+            # expected. state "comma": a comma or the closing bracket
+            # is expected. after_comma distinguishes "[1,]" (a trailing
+            # comma, malformed) from "[]" and "[1]" (clean closes).
+            state = "value"
+            after_comma = False
             while True:
                 while True:
-                    while pos < len(buf) and buf[pos] in " \t\r\n,":
-                        if buf[pos] == ",":
-                            if not expect_value and index > 0:
-                                expect_value = True
+                    while pos < len(buf) and buf[pos] in " \t\r\n":
                         pos += 1
                     if pos < len(buf):
                         break
                     if not fill():
                         break
                 if pos >= len(buf):
-                    if index == 0:
-                        return
-                    self.truncated = True
-                    self.truncation_note = (
-                        "array ended without closing bracket after %d elements"
-                        % index)
+                    fail("array ended without closing bracket after "
+                         "%d elements" % index)
                     return
-                if buf[pos] == "]":
+                ch = buf[pos]
+                if ch == "]":
+                    if after_comma:
+                        fail("element %d could not be parsed (trailing "
+                             "comma before ']'); rest of file uncounted"
+                             % (index + 1))
+                        return
+                    pos += 1
+                    # Anything but whitespace after the closing
+                    # bracket is uncounted data and is stated, not
+                    # silently dropped.
+                    trailing = False
+                    while True:
+                        while pos < len(buf) and buf[pos] in " \t\r\n":
+                            pos += 1
+                        if pos < len(buf):
+                            trailing = True
+                            break
+                        if not fill():
+                            break
+                    if trailing:
+                        fail("data found after the closing bracket; "
+                             "rest of file uncounted")
+                    return
+                if ch == ",":
+                    if state != "comma":
+                        fail("element %d could not be parsed "
+                             "(unexpected ','); rest of file uncounted"
+                             % (index + 1))
+                        return
+                    pos += 1
+                    state = "value"
+                    after_comma = True
+                    continue
+                if state == "comma":
+                    fail("element %d could not be parsed (missing ',' "
+                         "between elements); rest of file uncounted"
+                         % (index + 1))
                     return
                 try:
                     item, end = decoder.raw_decode(buf, pos)
                 except Exception as exc:
                     if fill():
                         continue
-                    self.truncated = True
-                    self.truncation_note = (
-                        "element %d could not be parsed (%s); "
-                        "rest of file uncounted" % (index + 1, exc))
+                    fail("element %d could not be parsed (%s); "
+                         "rest of file uncounted" % (index + 1, exc))
                     return
+                if (isinstance(item, (int, float))
+                        and not isinstance(item, bool)
+                        and end == len(buf) and not eof):
+                    # A JSON number has valid proper prefixes: "7"
+                    # decodes cleanly even when the real token is a
+                    # 100-digit number continuing into the next chunk.
+                    # Refill and re-decode from the same start rather
+                    # than splitting one number into two elements.
+                    if fill():
+                        continue
                 pos = end
                 index += 1
-                expect_value = False
+                state = "comma"
+                after_comma = False
                 yield item
 
     def columns(self):
@@ -298,27 +414,46 @@ class JsonArrayReader:
 
 def _depth(value) -> int:
     """Container depth: a scalar is 0, an empty container is 1, and a
-    container is 1 plus the deepest child depth."""
-    if isinstance(value, dict):
-        if not value:
-            return 1
-        return 1 + max(_depth(v) for v in value.values())
-    if isinstance(value, list):
-        if not value:
-            return 1
-        return 1 + max(_depth(v) for v in value)
-    return 0
+    container is 1 plus the deepest child depth.
+
+    Iterative: the recursive version raised RecursionError on deeply
+    nested objects the JSON parser itself accepts (around 800 levels
+    once caller frames are counted), crashing schema analysis of a
+    valid file instead of describing it.
+    """
+    results = []
+    stack = [(value, False)]
+    while stack:
+        node, expanded = stack.pop()
+        if not isinstance(node, (dict, list)):
+            results.append(0)
+            continue
+        children = (list(node.values()) if isinstance(node, dict)
+                    else node)
+        if not expanded:
+            stack.append((node, True))
+            for child in children:
+                stack.append((child, False))
+            continue
+        if not children:
+            results.append(1)
+        else:
+            child_depths = results[-len(children):]
+            del results[-len(children):]
+            results.append(1 + max(child_depths))
+    return results[0]
 
 
 def _count_keys(value) -> int:
     total = 0
-    if isinstance(value, dict):
-        total += len(value)
-        for v in value.values():
-            total += _count_keys(v)
-    elif isinstance(value, list):
-        for v in value:
-            total += _count_keys(v)
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            total += len(node)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
     return total
 
 
@@ -360,7 +495,7 @@ class JsonObjectReader:
                 "file is refused. Array-shaped JSON streams and has no "
                 "such limit" % (size, MAX_OBJECT_BYTES))
         parts = []
-        with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(self.path, "r", encoding="utf-8-sig", errors="replace") as fh:
             while True:
                 chunk = fh.read(CHUNK)
                 if not chunk:
@@ -401,7 +536,7 @@ class JsonObjectReader:
 def peek_json_shape(path: str) -> str:
     """Return the first non-whitespace character of a JSON file, or
     an empty string for an empty or whitespace-only file."""
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
         while True:
             chunk = fh.read(4096)
             if not chunk:
@@ -412,6 +547,15 @@ def peek_json_shape(path: str) -> str:
 
 
 def open_reader(path, fmt=None, token_sink=None):
+    """Open the reader for a file, detecting the format when ``fmt``
+    is None.
+
+    ``fmt`` may be csv, tsv, jsonl, json-object, or json. Plain json
+    dispatches on the top-level shape: an array streams through
+    JsonArrayReader, an object goes to JsonObjectReader under its
+    size guard, and a bare scalar raises DataError. An unknown format
+    name also raises DataError.
+    """
     fmt = fmt or detect_format(path)
     if fmt in ("csv", "tsv"):
         return DelimitedReader(path, fmt, token_sink=token_sink)
@@ -438,13 +582,27 @@ def open_reader(path, fmt=None, token_sink=None):
 
 
 def _dedupe_names(names):
+    """Make header names unique: the second "id" becomes "id#2", the
+    third "id#3", and so on, keeping first occurrences untouched."""
+    # Generated suffixes must not collide with a name that is already
+    # in the header: ["a", "a#2", "a"] used to produce two columns
+    # both named "a#2", leaving the schema (and every dict built by
+    # zipping names to values) ambiguous.
     seen = {}
+    used = set()
+    originals = set(names)
     out = []
     for name in names:
-        if name in seen:
-            seen[name] += 1
-            out.append("%s#%d" % (name, seen[name]))
-        else:
-            seen[name] = 1
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] == 1 and name not in used:
             out.append(name)
+            used.add(name)
+            continue
+        n = max(seen[name], 2)
+        candidate = "%s#%d" % (name, n)
+        while candidate in used or candidate in originals:
+            n += 1
+            candidate = "%s#%d" % (name, n)
+        out.append(candidate)
+        used.add(candidate)
     return out

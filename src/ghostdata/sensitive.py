@@ -27,6 +27,18 @@ NAME_PATTERNS = [
     (re.compile(r"private[-_]?key", re.I), "column name matches private key"),
 ]
 
+# Name matching works on whole words, not raw substrings. The patterns
+# above applied with re.search matched the sensitive fragment inside
+# unrelated words: "hotel" and "satellite" matched phone (tel),
+# "passenger_count" and "compass" matched password (pass), "footprint"
+# matched auth code (otp), "discard" and "cardinality" matched card.
+# Those columns lost their whole sample to a substring accident.
+# name_reason() below tokenises the column name (splitting on
+# separators and on camelCase boundaries, so password_hash,
+# passwordHash, and PASSWORD_HASH all tokenise alike) and matches
+# whole tokens or adjacent token pairs. The reason strings are the
+# ones NAME_PATTERNS has always produced, in the same order.
+
 _EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
 _SSN = re.compile(r"^\d{3}-\d{2}-\d{4}$")
 _PHONE_CHARS = re.compile(r"^\+?[\d\s().-]+$")
@@ -34,6 +46,8 @@ _CARD_CHARS = re.compile(r"^[\d\s-]+$")
 
 
 def _luhn_ok(digits: str) -> bool:
+    """True when a string of decimal digits passes the Luhn checksum
+    used by payment card numbers."""
     total = 0
     alt = False
     for ch in reversed(digits):
@@ -89,10 +103,77 @@ def shape_of_int(value: int):
     return None
 
 
+def _name_tokens(column_name: str):
+    """Split a column name into lowercase word tokens.
+
+    Separators (underscore, hyphen, spaces, dots) split, camelCase
+    boundaries split (including acronym boundaries: APIKey becomes
+    api + key), and trailing digits are dropped (password1 is the
+    password word). A glued compound such as "mysecretkey" stays one
+    token and no longer matches: that is the accepted price of not
+    redacting "hotel" for containing "tel".
+    """
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", column_name or "")
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
+    tokens = []
+    for part in re.split(r"[^A-Za-z0-9]+", s):
+        token = part.lower().rstrip("0123456789")
+        if token:
+            tokens.append(token)
+    return tokens
+
+
 def name_reason(column_name: str):
-    for pattern, reason in NAME_PATTERNS:
-        if pattern.search(column_name or ""):
-            return reason
+    """Return the redaction reason when a column or key name matches
+    a sensitive name pattern (password, token, email, card, and kin),
+    or None when no pattern matches."""
+    tokens = _name_tokens(column_name)
+    if not tokens:
+        return None
+    have = set(tokens)
+    pairs = set(zip(tokens, tokens[1:]))
+
+    def tok(*words):
+        return any(w in have for w in words)
+
+    def phrase(a, b):
+        # The second word may be pluralised (api_keys, pin_codes).
+        return (a, b) in pairs or (a, b + "s") in pairs
+
+    # Rule order mirrors NAME_PATTERNS: the first matching rule wins,
+    # so e.g. "credit_card" still reports the card reason.
+    if (tok("pass", "password", "passwd", "passphrase")
+            or phrase("pass", "word") or phrase("pass", "wd")
+            or phrase("pass", "phrase")):
+        return "column name matches password"
+    if tok("secret", "secrets"):
+        return "column name matches secret"
+    if tok("token", "tokens"):
+        return "column name matches token"
+    if tok("apikey", "apikeys") or phrase("api", "key"):
+        return "column name matches api key"
+    if tok("credential", "credentials"):
+        return "column name matches credential"
+    if (tok("otp", "authcode", "pincode")
+            or phrase("auth", "code") or phrase("pin", "code")):
+        return "column name matches auth code"
+    if tok("email") or phrase("e", "mail"):
+        return "column name matches email"
+    if tok("phone", "phones", "mobile", "tel", "telephone",
+           "cellphone", "smartphone"):
+        return "column name matches phone"
+    if tok("ssn") or phrase("social", "security"):
+        return "column name matches ssn"
+    if tok("card", "cards", "creditcard"):
+        return "column name matches card"
+    if tok("credit"):
+        return "column name matches credit"
+    if tok("cvv", "cvc"):
+        return "column name matches cvv"
+    if tok("iban") or phrase("bank", "account"):
+        return "column name matches bank account"
+    if phrase("private", "key"):
+        return "column name matches private key"
     return None
 
 
@@ -112,38 +193,79 @@ def redact_nested(value, path=""):
     returned structurally identical, so a value with no sensitive
     content round-trips unchanged.
     """
+    # Iterative post-order rebuild with an explicit stack: the
+    # recursive version died with RecursionError on deeply nested
+    # values that the JSON parser itself accepts (a few hundred
+    # levels is enough once the caller's own frames are counted),
+    # crashing the whole analysis instead of redacting the sample.
+    # Op kinds: "visit" transforms a value; "named" records a
+    # name-redacted dict entry; "dict"/"list" assemble a container
+    # from the most recent child results. Children are pushed in
+    # reverse so they are processed (and hits recorded) in document
+    # order, exactly as the recursive version did.
     hits = []
-    if isinstance(value, dict):
-        out = {}
-        for key, sub in value.items():
-            sub_path = "%s.%s" % (path, key) if path else str(key)
-            reason = name_reason(str(key))
-            if reason:
-                out[key] = REDACTED
-                hits.append((sub_path, reason))
-                continue
-            new_sub, sub_hits = redact_nested(sub, sub_path)
-            out[key] = new_sub
-            hits.extend(sub_hits)
-        return out, hits
-    if isinstance(value, (list, tuple)):
-        out = []
-        for i, sub in enumerate(value):
-            new_sub, sub_hits = redact_nested(sub, "%s[%d]" % (path, i))
-            out.append(new_sub)
-            hits.extend(sub_hits)
-        return out, hits
-    if isinstance(value, str):
-        shape = shape_of(value)
-        if shape:
-            return REDACTED, [(path, "value matches %s shape" % shape)]
-        return value, hits
-    if isinstance(value, int) and not isinstance(value, bool):
-        shape = shape_of_int(value)
-        if shape:
-            return REDACTED, [(path, "value matches %s shape" % shape)]
-        return value, hits
-    return value, hits
+    results = []
+    stack = [("visit", value, path)]
+    while stack:
+        op = stack.pop()
+        kind = op[0]
+        if kind == "visit":
+            _, node, node_path = op
+            if isinstance(node, dict):
+                keys = list(node.keys())
+                stack.append(("dict", keys))
+                for key in reversed(keys):
+                    sub_path = ("%s.%s" % (node_path, key)
+                                if node_path else str(key))
+                    reason = name_reason(str(key))
+                    if reason:
+                        stack.append(("named", sub_path, reason))
+                    else:
+                        stack.append(("visit", node[key], sub_path))
+            elif isinstance(node, (list, tuple)):
+                stack.append(("list", len(node)))
+                for i in range(len(node) - 1, -1, -1):
+                    stack.append(
+                        ("visit", node[i], "%s[%d]" % (node_path, i)))
+            elif isinstance(node, str):
+                shape = shape_of(node)
+                if shape:
+                    hits.append(
+                        (node_path, "value matches %s shape" % shape))
+                    results.append(REDACTED)
+                else:
+                    results.append(node)
+            elif isinstance(node, int) and not isinstance(node, bool):
+                shape = shape_of_int(node)
+                if shape:
+                    hits.append(
+                        (node_path, "value matches %s shape" % shape))
+                    results.append(REDACTED)
+                else:
+                    results.append(node)
+            else:
+                results.append(node)
+        elif kind == "named":
+            _, sub_path, reason = op
+            hits.append((sub_path, reason))
+            results.append(REDACTED)
+        elif kind == "dict":
+            _, keys = op
+            if keys:
+                children = results[-len(keys):]
+                del results[-len(keys):]
+            else:
+                children = []
+            results.append(dict(zip(keys, children)))
+        else:  # "list"
+            _, count = op
+            if count:
+                children = results[-count:]
+                del results[-count:]
+            else:
+                children = []
+            results.append(list(children))
+    return results[0], hits
 
 
 # A column is shape-redacted when at least this share of its checked
@@ -154,6 +276,14 @@ SHAPE_MIN_RATIO = 0.2
 
 
 def shape_reason(shape_hits: dict, strings_checked: int):
+    """Decide shape-based redaction from a column's hit counters.
+
+    A shape triggers redaction when it has at least SHAPE_MIN_HITS
+    hits covering at least SHAPE_MIN_RATIO of the checked values, or
+    when every checked value matches it. The returned reason names
+    the shape and the hit count, for example "values match card
+    shape (3 of 3 checked)", and never includes a value itself.
+    """
     if strings_checked <= 0:
         return None
     for shape, hits in sorted(shape_hits.items()):

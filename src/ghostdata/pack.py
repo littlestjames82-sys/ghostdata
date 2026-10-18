@@ -16,6 +16,13 @@ REDACTED = "[REDACTED]"
 
 
 def render_sample(result: dict) -> str:
+    """Render an analyze() result's sample rows in the source format.
+
+    CSV and TSV samples keep the header row, JSONL samples hold one
+    object per line, and JSON samples (array or single object) are
+    pretty-printed. Redaction has already happened in analyze(); this
+    only formats what it was given.
+    """
     fmt = result["format"]
     cols = result["columns"]
     rows = result["sample"]["_rows"]
@@ -49,6 +56,9 @@ def render_sample(result: dict) -> str:
 
 
 def _cell(value):
+    """Format one value for a delimited sample cell: null becomes
+    empty, booleans become true/false, and nested values are rendered
+    as compact JSON so a row stays on one line."""
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -59,6 +69,7 @@ def _cell(value):
 
 
 def sample_ext(fmt: str) -> str:
+    """Return the sample file extension for a format name."""
     return {"csv": ".csv", "tsv": ".tsv",
             "jsonl": ".jsonl", "json": ".json",
             "json-object": ".json"}[fmt]
@@ -66,11 +77,28 @@ def sample_ext(fmt: str) -> str:
 
 def build_pack(path: str, out_dir: str, sample_size: int = 60,
                redact: bool = True, fmt: str = None) -> dict:
+    """Build a pack for one data file and return its manifest dict.
+
+    Writes manifest.json, PROMPT.md, and the sample file under
+    ``out_dir/files/``, creating directories as needed. The manifest
+    records the source name, format, byte size, and sha256, the true
+    row counts, the per-column schema, the redaction record, the
+    sample description with its sha256, and token estimates with the
+    estimator method stamped. Raises ValueError if the output
+    directory is the source file itself.
+    """
     path = os.path.abspath(path)
     if os.path.abspath(out_dir) == path:
         raise ValueError("output directory must not be the source file")
     result = analyze(path, sample_size=sample_size, redact=redact, fmt=fmt)
-    sample_text = render_sample(result)
+    try:
+        sample_text = render_sample(result)
+    except RecursionError:
+        # A record nested deeper than the interpreter's stack (the
+        # JSON parser accepts more than json.dumps can re-emit).
+        # Report it as a stated error, not a traceback.
+        raise ValueError(
+            "sample is nested too deeply to render") from None
     base = os.path.splitext(os.path.basename(path))[0]
     sample_name = "%s.sample%s" % (base, sample_ext(result["format"]))
 
@@ -145,6 +173,9 @@ def build_pack(path: str, out_dir: str, sample_size: int = 60,
 
 
 def render_prompt(manifest: dict, sample_text: str) -> str:
+    """Render a pack's PROMPT.md: the agent-readable summary of a
+    manifest (format, counts, token estimates, schema table, any
+    redaction or truncation notes) followed by the sample itself."""
     src = manifest["source"]
     counts = manifest["counts"]
     lines = ["# Data pack: %s" % src["file"], ""]
@@ -222,7 +253,49 @@ def render_prompt(manifest: dict, sample_text: str) -> str:
     return "\n".join(lines)
 
 
+def _count_sample_rows(sample_path: str, fmt: str):
+    """Recount the rows actually in a sample file, by format.
+
+    Returns None when the format is unknown (nothing to recount
+    against). Raises on an unreadable or unparseable sample file.
+    """
+    if fmt in ("csv", "tsv"):
+        with open(sample_path, "r", encoding="utf-8-sig",
+                  errors="replace", newline="") as fh:
+            rows = [row for row in csv.reader(
+                fh, delimiter="\t" if fmt == "tsv" else ",") if row]
+        return len(rows) - 1 if rows else 0  # minus the header row
+    if fmt == "jsonl":
+        with open(sample_path, "r", encoding="utf-8-sig",
+                  errors="replace") as fh:
+            return sum(1 for line in fh if line.strip())
+    if fmt == "json":
+        with open(sample_path, "r", encoding="utf-8-sig",
+                  errors="replace") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            raise ValueError("json sample is not an array")
+        return len(data)
+    if fmt == "json-object":
+        with open(sample_path, "r", encoding="utf-8-sig",
+                  errors="replace") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("json-object sample is not an object")
+        return 1
+    return None
+
+
 def check_pack(pack_dir: str) -> dict:
+    """Verify a pack directory against its manifest.
+
+    Checks that manifest.json exists and parses, that the sample file
+    is present and its sha256 matches the manifest, that row counts
+    are consistent (total equals parsed plus malformed), and that the
+    sample holds no more rows than the file parsed. Returns a dict
+    with ``ok``, an ``errors`` list naming each problem found, and
+    ``files_checked``.
+    """
     errors = []
     manifest_path = os.path.join(pack_dir, "manifest.json")
     if not os.path.isfile(manifest_path):
@@ -243,6 +316,27 @@ def check_pack(pack_dir: str) -> dict:
                 digest.update(chunk)
         if digest.hexdigest() != manifest["sample"].get("sha256"):
             errors.append("sample file sha256 does not match manifest")
+        # The hash only proves the file matches the manifest that
+        # ships with it; a manifest edited together with its sample
+        # (or with lying counts) passed every check here. Recount the
+        # sample file itself and compare with the stated row count.
+        try:
+            actual_rows = _count_sample_rows(
+                sample_path, manifest.get("source", {}).get("format"))
+        except Exception as exc:
+            errors.append("sample file unreadable: %s" % exc)
+            actual_rows = None
+        stated_rows = manifest.get("sample", {}).get("rows")
+        if actual_rows is not None and actual_rows != stated_rows:
+            errors.append(
+                "sample row count does not match manifest: manifest "
+                "says %s, file contains %d" % (stated_rows, actual_rows))
+        indices = manifest.get("sample", {}).get("row_indices")
+        if isinstance(indices, list) and isinstance(stated_rows, int) \
+                and len(indices) != stated_rows:
+            errors.append(
+                "sample row_indices length (%d) does not match the "
+                "sample row count (%d)" % (len(indices), stated_rows))
     counts = manifest.get("counts", {})
     if counts.get("rows_total") != (
             counts.get("rows_parsed", 0) + counts.get("rows_malformed", 0)):

@@ -1,3 +1,4 @@
+"""Entry point for ``python3 -m ghostdata``; delegates to cli.main."""
 from .cli import main
 
 if __name__ == "__main__":

@@ -35,6 +35,9 @@ TOOLS = [
 
 
 def _summary(result):
+    """Trim an analyze() result to the MCP summary payload: format,
+    counts (malformed examples capped at five), schema, and the
+    redaction record. Sample rows are never included."""
     out = {
         "format": result["format"],
         "counts": {k: v for k, v in result["counts"].items()
@@ -51,6 +54,13 @@ def _summary(result):
 
 
 def handle(request: dict):
+    """Handle one JSON-RPC request dict and return the response dict.
+
+    Supports initialize, tools/list, and tools/call for the
+    data_schema and data_pack tools. Notifications (requests with no
+    id) that need no reply return None. Tool arguments accept "path"
+    and its alias "file" for the input file.
+    """
     method = request.get("method", "")
     rid = request.get("id")
     if method == "initialize":
@@ -89,7 +99,13 @@ def handle(request: dict):
             else:
                 return {"jsonrpc": "2.0", "id": rid, "error": {
                     "code": -32602, "message": "unknown tool: %s" % name}}
-        except (DataError, ValueError, KeyError, OSError) as exc:
+        except (DataError, ValueError, KeyError, TypeError,
+                AttributeError, OSError) as exc:
+            # TypeError/AttributeError cover malformed call arguments
+            # (a missing path, a null sample size, non-dict
+            # arguments): the caller gets a JSON-RPC error, not an
+            # exception escaping handle() (serve() then misreported
+            # it as a -32700 parse error).
             return {"jsonrpc": "2.0", "id": rid, "error": {
                 "code": -32000, "message": str(exc)}}
         text = json.dumps(payload, indent=2)
@@ -104,6 +120,9 @@ def handle(request: dict):
 
 
 def serve(stdin=None, stdout=None) -> None:
+    """Serve JSON-RPC requests, one JSON object per line, until the
+    input reaches EOF. Local stdio only; nothing is opened on the
+    network."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     for line in stdin:
