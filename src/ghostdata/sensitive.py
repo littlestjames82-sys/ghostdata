@@ -272,6 +272,22 @@ def redact_nested(value, path=""):
 # string values match one shape, with a small absolute floor so one
 # stray look-alike in a huge column does not trigger it alone.
 SHAPE_MIN_HITS = 2
+def display_name(name):
+    """The name a column is shown under in schema / pack
+    output. A header that is really a KEY=VALUE line (an
+    .env or .ini read as CSV) carries the secret in the
+    name itself: name-based redaction cannot see it (the
+    KEY is innocuous) and value redaction never scans
+    names. Mask everything after the first '=' so the
+    shape of the file stays visible and the value does
+    not. (GhostIDE audit A7 observation, Cycle 2 I4.)"""
+    if isinstance(name, str) and "=" in name:
+        head, _, tail = name.partition("=")
+        if tail.strip():
+            return head + "=<redacted>"
+    return name
+
+
 SHAPE_MIN_RATIO = 0.2
 
 

@@ -302,12 +302,13 @@ def analyze(path: str, sample_size: int = DEFAULT_SAMPLE,
         counts["truncation_note"] = truncation_note
     return {
         "format": reader.format,
-        "columns": columns,
+        "columns": [sensitive.display_name(c) for c in columns],
         "schema": schema,
         "counts": counts,
         "structure": getattr(reader, "structure", None),
         "redacted_columns": [
-            {"name": name, "reason": reason}
+            {"name": sensitive.display_name(name),
+             "reason": reason}
             for name, reason in redactions.items()],
         "redacted_nested": nested_records,
         "redaction_enabled": redact,

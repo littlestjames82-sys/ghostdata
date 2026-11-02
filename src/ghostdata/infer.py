@@ -237,7 +237,7 @@ class ColumnStats:
         """
         total = self.total
         out = {
-            "name": self.name,
+            "name": sensitive.display_name(self.name),
             "type": self.inferred_type(),
             "types_seen": dict(sorted(self.types.items())),
             "null_count": self.nulls,
