@@ -1,4 +1,5 @@
 # GhostData
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Structured data slicer for GhostSlice. Point it at a data file that is
 too big to hand an agent whole, a 40 MB CSV export or a JSONL log with
@@ -225,3 +226,16 @@ Zero dependencies, Python standard library only, Python 3.11 and up.
 Layout: `src/ghostdata/` is the core (Agent A), `tests/`,
 `examples/`, and this README are the test and docs surface (Agent B).
 See `PLAN.md` for the design and `REPORT_B.md` for the test record.
+
+---
+<!-- ghost-studio-footer -->
+## More from Ghost Developer Studio
+
+Ghost Developer Studio builds developer tools, AI-agent safety software, and practical apps, and sells by showing working software, not slide decks.
+
+- [Roadmap board](https://github.com/littlestjames82-sys/ghost-roadmaps): where every studio product stands
+- [Agent Seatbelt](https://github.com/littlestjames82-sys/agent-seatbelt): deterministic guardrails for AI coding agents
+- [Ghost Hands](https://github.com/littlestjames82-sys/ghost-hands): governed, recorded, replayable agent hands
+- [GhostSlice](https://github.com/littlestjames82-sys/ghostslice): agent context and prompt optimizer
+- [GhostIDE](https://github.com/littlestjames82-sys/ghostide-android): fully offline AI code editor for Android
+- [All studio projects](https://github.com/littlestjames82-sys?tab=repositories)
