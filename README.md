@@ -1,5 +1,5 @@
 # GhostData
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostdata/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostdata/actions/workflows/ci.yml)
 
 Structured data slicer for GhostSlice. Point it at a data file that is
 too big to hand an agent whole, a 40 MB CSV export or a JSONL log with
